@@ -1,5 +1,43 @@
 import PostalMime from "postal-mime";
 
+// ---- Configuration bound from wrangler.toml -------------------------------
+interface Env {
+  DB: D1Database;
+  FEED_TOKEN: string;
+  FEED_TITLE: string;
+}
+
+// ---- Row shapes returned by D1 --------------------------------------------
+interface EmailRow {
+  id: number;
+  message_id: string;
+  from_addr: string;
+  from_name: string | null;
+  subject: string;
+  html: string;
+  text: string | null;
+  received_at: number;
+}
+
+interface ErrorRow {
+  id: number;
+  from_addr: string | null;
+  subject: string | null;
+  reason: string;
+  error: string | null;
+  raw: string | null;
+  received_at: number;
+}
+
+interface RecordErrorInput {
+  from_addr: string | null;
+  subject: string | null;
+  reason: "parse_failed" | "no_html";
+  error: string | null;
+  rawBytes: Uint8Array;
+  receivedAt: number;
+}
+
 export default {
   // ---- 1. Inbound email: parse, then store in D1 ----
   async email(message, env, ctx) {
@@ -20,7 +58,7 @@ export default {
         from_addr: message.from || null,
         subject: null,
         reason: "parse_failed",
-        error: String(e && e.message ? e.message : e),
+        error: String(e && (e as Error).message ? (e as Error).message : e),
         rawBytes,
         receivedAt,
       });
@@ -97,7 +135,7 @@ export default {
            FROM emails
           ORDER BY received_at DESC
           LIMIT 100`
-      ).all();
+      ).all<EmailRow>();
       return new Response(buildRss(results || [], url, env.FEED_TITLE), {
         headers: {
           "Content-Type": "application/rss+xml; charset=utf-8",
@@ -129,20 +167,20 @@ export default {
 
     return new Response("Not found", { status: 404 });
   },
-};
+} satisfies ExportedHandler<Env>;
 
-function html(body, status = 200) {
+function html(body: string, status = 200): Response {
   return new Response(body, {
     status,
     headers: { "Content-Type": "text/html; charset=utf-8" },
   });
 }
 
-function escapeRegex(s) {
+function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function buildRss(rows, url, title) {
+function buildRss(rows: EmailRow[], url: URL, title: string): string {
   const feedTitle = title || "Forwarded Newsletters";
   const self = url.href;
   const home = `${url.protocol}//${url.host}`;
@@ -214,7 +252,7 @@ const STYLE = `
   .meta .k { opacity: 0.55; display: inline-block; min-width: 70px; }
 `;
 
-function layout(base, title, inner) {
+function layout(base: string, title: string, inner: string): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -238,17 +276,17 @@ ${inner}
 </html>`;
 }
 
-function fmtDate(epochSeconds) {
+function fmtDate(epochSeconds: number | null | undefined): string {
   if (!epochSeconds) return "";
   return new Date(epochSeconds * 1000).toISOString().replace("T", " ").slice(0, 16);
 }
 
-async function renderDashboard(env, base) {
-  const emails = await env.DB.prepare(`SELECT COUNT(*) AS n FROM emails`).first();
-  const errors = await env.DB.prepare(`SELECT COUNT(*) AS n FROM errors`).first();
+async function renderDashboard(env: Env, base: string): Promise<string> {
+  const emails = await env.DB.prepare(`SELECT COUNT(*) AS n FROM emails`).first<{ n: number }>();
+  const errors = await env.DB.prepare(`SELECT COUNT(*) AS n FROM errors`).first<{ n: number }>();
   const latest = await env.DB.prepare(
     `SELECT received_at FROM emails ORDER BY received_at DESC LIMIT 1`
-  ).first();
+  ).first<{ received_at: number }>();
 
   const inner = `
   <h1>Newsletter feed</h1>
@@ -264,11 +302,11 @@ async function renderDashboard(env, base) {
   return layout(base, "Dashboard", inner);
 }
 
-async function renderEmailList(env, base) {
+async function renderEmailList(env: Env, base: string): Promise<string> {
   const { results } = await env.DB.prepare(
     `SELECT id, from_addr, from_name, subject, received_at
        FROM emails ORDER BY received_at DESC LIMIT 200`
-  ).all();
+  ).all<Pick<EmailRow, "id" | "from_addr" | "from_name" | "subject" | "received_at">>();
 
   if (!results || results.length === 0) {
     return layout(base, "Emails", `<h1>Emails</h1><p class="empty">No emails stored yet.</p>`);
@@ -295,12 +333,12 @@ ${rows}
   return layout(base, "Emails", inner);
 }
 
-async function renderEmailView(env, base, id) {
+async function renderEmailView(env: Env, base: string, id: number): Promise<Response> {
   const r = await env.DB.prepare(
     `SELECT from_addr, from_name, subject, html, received_at FROM emails WHERE id = ?`
   )
     .bind(id)
-    .first();
+    .first<Pick<EmailRow, "from_addr" | "from_name" | "subject" | "html" | "received_at">>();
 
   if (!r) return html(layout(base, "Not found", `<h1>Email not found</h1>`), 404);
 
@@ -318,11 +356,11 @@ async function renderEmailView(env, base, id) {
   return html(layout(base, r.subject || "Email", inner));
 }
 
-async function renderErrorList(env, base) {
+async function renderErrorList(env: Env, base: string): Promise<string> {
   const { results } = await env.DB.prepare(
     `SELECT id, from_addr, subject, reason, received_at
        FROM errors ORDER BY received_at DESC LIMIT 200`
-  ).all();
+  ).all<Pick<ErrorRow, "id" | "from_addr" | "subject" | "reason" | "received_at">>();
 
   if (!results || results.length === 0) {
     return layout(base, "Errors", `<h1>Errors</h1><p class="empty">No errors. 🎉</p>`);
@@ -349,12 +387,12 @@ ${rows}
   return layout(base, "Errors", inner);
 }
 
-async function renderErrorView(env, base, id) {
+async function renderErrorView(env: Env, base: string, id: number): Promise<string> {
   const r = await env.DB.prepare(
     `SELECT from_addr, subject, reason, error, raw, received_at FROM errors WHERE id = ?`
   )
     .bind(id)
-    .first();
+    .first<Pick<ErrorRow, "from_addr" | "subject" | "reason" | "error" | "raw" | "received_at">>();
 
   if (!r) return layout(base, "Not found", `<h1>Error not found</h1>`);
 
@@ -371,8 +409,11 @@ async function renderErrorView(env, base, id) {
   return layout(base, "Error", inner);
 }
 
-async function recordError(env, { from_addr, subject, reason, error, rawBytes, receivedAt }) {
-  let raw = null;
+async function recordError(
+  env: Env,
+  { from_addr, subject, reason, error, rawBytes, receivedAt }: RecordErrorInput
+): Promise<void> {
+  let raw: string | null = null;
   try {
     raw = new TextDecoder("utf-8").decode(rawBytes);
   } catch (_) {
@@ -393,7 +434,7 @@ async function recordError(env, { from_addr, subject, reason, error, rawBytes, r
   }
 }
 
-function escapeXml(s) {
+function escapeXml(s: unknown): string {
   return String(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -402,7 +443,7 @@ function escapeXml(s) {
     .replace(/'/g, "&apos;");
 }
 
-function escapeHtml(s) {
+function escapeHtml(s: unknown): string {
   return String(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -412,7 +453,7 @@ function escapeHtml(s) {
 // For embedding a full HTML document inside a double-quoted srcdoc attribute.
 // Only & and " strictly need escaping for attribute safety; we also escape
 // < and > defensively so the markup can't break out of the attribute.
-function escapeAttr(s) {
+function escapeAttr(s: unknown): string {
   return String(s)
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;")

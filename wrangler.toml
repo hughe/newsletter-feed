@@ -1,0 +1,21 @@
+# Worker config. See PLAN.md "Build & deploy" for the full setup steps.
+name = "newsletter-rss"
+main = "index.ts"
+compatibility_date = "2025-01-01"
+
+# D1 binding. Create the database once with:
+#   npx wrangler d1 create newsletters
+# then paste the printed database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "newsletters"
+database_id = "REPLACE_WITH_DATABASE_ID"
+
+[vars]
+# RSS channel title.
+FEED_TITLE = "Forwarded Newsletters"
+# FEED_TOKEN gates ALL URLs (feed + admin). Generate with:
+#   openssl rand -hex 24
+# For better secrecy, drop it here and instead run:
+#   npx wrangler secret put FEED_TOKEN
+FEED_TOKEN = "REPLACE_WITH_TOKEN"
