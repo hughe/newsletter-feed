@@ -38,6 +38,27 @@ interface RecordErrorInput {
   receivedAt: number;
 }
 
+// Result of parsing+extracting a raw message, without touching the DB. Both
+// the live email() handler and the replay endpoint run this, so a parser fix
+// applies identically to incoming mail and to reprocessed failures.
+interface IngestSuccess {
+  ok: true;
+  messageId: string;
+  from_addr: string;
+  from_name: string;
+  subject: string;
+  html: string;
+  text: string;
+}
+interface IngestFailure {
+  ok: false;
+  reason: "parse_failed" | "no_html";
+  from_addr: string | null;
+  subject: string | null;
+  error: string | null;
+}
+type IngestResult = IngestSuccess | IngestFailure;
+
 export default {
   // ---- 1. Inbound email: parse, then store in D1 ----
   async email(message, env, ctx) {
@@ -50,76 +71,20 @@ export default {
       await new Response(message.raw).arrayBuffer()
     );
 
-    let parsed;
-    try {
-      parsed = await PostalMime.parse(rawBytes);
-    } catch (e) {
+    const result = await ingest(rawBytes, message.from || null);
+    if (!result.ok) {
       await recordError(env, {
-        from_addr: message.from || null,
-        subject: null,
-        reason: "parse_failed",
-        error: String(e && (e as Error).message ? (e as Error).message : e),
+        from_addr: result.from_addr,
+        subject: result.subject,
+        reason: result.reason,
+        error: result.error,
         rawBytes,
         receivedAt,
       });
       return;
     }
 
-    // When you forward a newsletter, your mail client usually keeps the
-    // original HTML as the main body. But some clients nest the original
-    // as a message/rfc822 attachment. Prefer a nested original if present.
-    let html = parsed.html || "";
-    let text = parsed.text || "";
-    let subject = parsed.subject || "(no subject)";
-    let fromAddr = parsed.from?.address || message.from || "unknown";
-    let fromName = parsed.from?.name || "";
-
-    const nested = (parsed.attachments || []).find(
-      (a) => a.mimeType === "message/rfc822"
-    );
-    if (nested && nested.content) {
-      try {
-        const inner = await PostalMime.parse(nested.content);
-        if (inner.html) html = inner.html;
-        if (inner.text) text = inner.text;
-        if (inner.subject) subject = inner.subject;
-        if (inner.from?.address) {
-          fromAddr = inner.from.address;
-          fromName = inner.from.name || fromName;
-        }
-      } catch (e) {
-        // fall back to the outer message; not fatal
-      }
-    }
-
-    // If there's truly no HTML, wrap the plaintext so the feed still renders.
-    if (!html && text) {
-      html = `<pre style="white-space:pre-wrap">${escapeHtml(text)}</pre>`;
-    }
-
-    // No HTML and no text at all: nothing usable to put in the feed.
-    if (!html) {
-      await recordError(env, {
-        from_addr: fromAddr,
-        subject,
-        reason: "no_html",
-        error: null,
-        rawBytes,
-        receivedAt,
-      });
-      return;
-    }
-
-    const messageId =
-      parsed.messageId || `${fromAddr}-${subject}-${Date.now()}`;
-
-    await env.DB.prepare(
-      `INSERT OR IGNORE INTO emails
-         (message_id, from_addr, from_name, subject, html, text, received_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(messageId, fromAddr, fromName, subject, html, text, receivedAt)
-      .run();
+    await storeEmail(env, result, receivedAt);
   },
 
   // ---- 2. HTTP: feed + admin pages, all under the secret token prefix ----
@@ -160,6 +125,15 @@ export default {
     if (emailMatch) {
       return renderEmailView(env, base, Number(emailMatch[1]));
     }
+    // Reprocess a stored failure through the (possibly updated) parser.
+    // POST-only so it can't be triggered by a crawler following a link.
+    const replayMatch = path.match(new RegExp(`^${escapeRegex(base)}/error/(\\d+)/replay$`));
+    if (replayMatch) {
+      if (request.method !== "POST") {
+        return new Response("Method not allowed", { status: 405 });
+      }
+      return replayError(env, base, Number(replayMatch[1]));
+    }
     const errorMatch = path.match(new RegExp(`^${escapeRegex(base)}/error/(\\d+)$`));
     if (errorMatch) {
       return html(await renderErrorView(env, base, Number(errorMatch[1])));
@@ -168,6 +142,86 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
+
+// Parse a raw RFC822 message and extract the fields we store. Pure: no DB
+// access, and it never throws for an expected failure — parse errors and
+// missing bodies come back as an IngestFailure so callers decide what to do.
+async function ingest(
+  rawBytes: Uint8Array,
+  fallbackFrom: string | null
+): Promise<IngestResult> {
+  let parsed;
+  try {
+    parsed = await PostalMime.parse(rawBytes);
+  } catch (e) {
+    return {
+      ok: false,
+      reason: "parse_failed",
+      from_addr: fallbackFrom,
+      subject: null,
+      error: String(e && (e as Error).message ? (e as Error).message : e),
+    };
+  }
+
+  // When you forward a newsletter, your mail client usually keeps the
+  // original HTML as the main body. But some clients nest the original
+  // as a message/rfc822 attachment. Prefer a nested original if present.
+  let html = parsed.html || "";
+  let text = parsed.text || "";
+  let subject = parsed.subject || "(no subject)";
+  let fromAddr = parsed.from?.address || fallbackFrom || "unknown";
+  let fromName = parsed.from?.name || "";
+
+  const nested = (parsed.attachments || []).find(
+    (a) => a.mimeType === "message/rfc822"
+  );
+  if (nested && nested.content) {
+    try {
+      const inner = await PostalMime.parse(nested.content);
+      if (inner.html) html = inner.html;
+      if (inner.text) text = inner.text;
+      if (inner.subject) subject = inner.subject;
+      if (inner.from?.address) {
+        fromAddr = inner.from.address;
+        fromName = inner.from.name || fromName;
+      }
+    } catch (e) {
+      // fall back to the outer message; not fatal
+    }
+  }
+
+  // If there's truly no HTML, wrap the plaintext so the feed still renders.
+  if (!html && text) {
+    html = `<pre style="white-space:pre-wrap">${escapeHtml(text)}</pre>`;
+  }
+
+  // No HTML and no text at all: nothing usable to put in the feed.
+  if (!html) {
+    return { ok: false, reason: "no_html", from_addr: fromAddr, subject, error: null };
+  }
+
+  const messageId = parsed.messageId || `${fromAddr}-${subject}-${Date.now()}`;
+  return {
+    ok: true,
+    messageId,
+    from_addr: fromAddr,
+    from_name: fromName,
+    subject,
+    html,
+    text,
+  };
+}
+
+// Persist a successfully-ingested message. Deduped by message_id.
+async function storeEmail(env: Env, r: IngestSuccess, receivedAt: number): Promise<void> {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO emails
+       (message_id, from_addr, from_name, subject, html, text, received_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(r.messageId, r.from_addr, r.from_name, r.subject, r.html, r.text, receivedAt)
+    .run();
+}
 
 function html(body: string, status = 200): Response {
   return new Response(body, {
@@ -250,6 +304,11 @@ const STYLE = `
   .meta { margin: 8px 0 16px; }
   .meta div { margin: 2px 0; }
   .meta .k { opacity: 0.55; display: inline-block; min-width: 70px; }
+  form.replay { margin: 0 0 20px; display: flex; align-items: center; gap: 10px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+           color: CanvasText; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+           background: color-mix(in srgb, CanvasText 8%, transparent); }
+  button:hover { background: color-mix(in srgb, CanvasText 16%, transparent); }
 `;
 
 function layout(base: string, title: string, inner: string): string {
@@ -404,9 +463,65 @@ async function renderErrorView(env: Env, base: string, id: number): Promise<stri
     <div><span class="k">Received</span> ${fmtDate(r.received_at)}</div>
     ${r.error ? `<div><span class="k">Detail</span> ${escapeXml(r.error)}</div>` : ""}
   </div>
+  ${
+    r.raw
+      ? `<form method="post" action="${base}/error/${id}/replay" class="replay">
+    <button type="submit">Reprocess this message</button>
+    <span class="sub">Re-runs the parser; on success it moves to Emails and this error is removed.</span>
+  </form>`
+      : ""
+  }
   <h1 style="font-size:15px">Raw message</h1>
   <pre class="raw">${escapeXml(r.raw || "(raw message not stored)")}</pre>`;
   return layout(base, "Error", inner);
+}
+
+// Re-run the stored raw message through ingest(). On success it lands in the
+// emails table and the error row is deleted; on failure the row is kept so it
+// can be retried after a further parser fix.
+async function replayError(env: Env, base: string, id: number): Promise<Response> {
+  const row = await env.DB.prepare(
+    `SELECT raw, from_addr FROM errors WHERE id = ?`
+  )
+    .bind(id)
+    .first<{ raw: string | null; from_addr: string | null }>();
+
+  if (!row) return html(layout(base, "Not found", `<h1>Error not found</h1>`), 404);
+
+  if (!row.raw) {
+    const inner = `
+    <h1>Cannot replay</h1>
+    <p class="sub">No raw message was stored for this error, so there is nothing to reprocess.</p>
+    <p><a href="${base}/errors">Back to errors</a></p>`;
+    return html(layout(base, "Cannot replay", inner), 422);
+  }
+
+  // errors.raw is the UTF-8-decoded source; re-encode it back to bytes.
+  const result = await ingest(new TextEncoder().encode(row.raw), row.from_addr);
+
+  if (!result.ok) {
+    // Still failing. Leave the error row in place and report why.
+    const inner = `
+    <h1>Replay still failing</h1>
+    <div class="meta">
+      <div><span class="k">Reason</span> <span class="badge ${escapeXml(result.reason)}">${escapeXml(result.reason)}</span></div>
+      ${result.error ? `<div><span class="k">Detail</span> ${escapeXml(result.error)}</div>` : ""}
+    </div>
+    <p class="sub">The error row was kept. Fix the parser and try again.</p>
+    <p><a href="${base}/error/${id}">Back to error</a></p>`;
+    return html(layout(base, "Replay failed", inner));
+  }
+
+  // Success: store the message, then drop the now-resolved error row.
+  const receivedAt = Math.floor(Date.now() / 1000);
+  await storeEmail(env, result, receivedAt);
+  await env.DB.prepare(`DELETE FROM errors WHERE id = ?`).bind(id).run();
+
+  // 303 -> GET so a refresh of the destination doesn't re-POST.
+  return new Response(null, {
+    status: 303,
+    headers: { Location: `${base}/emails` },
+  });
 }
 
 async function recordError(

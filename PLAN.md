@@ -56,6 +56,7 @@ other auth; anyone with the token URL can read all pages and the feed.
 | `/feed/<token>/email/<id>`    | Single email; HTML rendered in a sandboxed iframe |
 | `/feed/<token>/errors`        | List of error rows (newest 200)                 |
 | `/feed/<token>/error/<id>`    | Single error: reason, detail, and raw message   |
+| `/feed/<token>/error/<id>/replay` (POST) | Re-ingest the stored raw message; on success it moves to `emails` and the error row is deleted |
 
 The single-email view renders the stored newsletter HTML inside an iframe with
 a restrictive `sandbox` (no scripts, no same-origin), so opening a stored email
