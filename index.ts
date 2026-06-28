@@ -121,6 +121,11 @@ export default {
       return html(await renderErrorList(env, base));
     }
 
+    // Bare, chrome-free view (just the sandboxed iframe) — the RSS item link.
+    const rawMatch = path.match(new RegExp(`^${escapeRegex(base)}/email/(\\d+)/view$`));
+    if (rawMatch) {
+      return renderEmailRaw(env, Number(rawMatch[1]));
+    }
     const emailMatch = path.match(new RegExp(`^${escapeRegex(base)}/email/(\\d+)$`));
     if (emailMatch) {
       return renderEmailView(env, base, Number(emailMatch[1]));
@@ -408,7 +413,7 @@ export function buildRss(rows: EmailRow[], url: URL, title: string, token: strin
       // <link> points at the Worker's own single-email view, which renders the
       // stored HTML faithfully in a browser — useful when an RSS reader mangles
       // the newsletter's CSS. (The token is already in the feed URL itself.)
-      const link = `${home}/feed/${token}/email/${r.id}`;
+      const link = `${home}/feed/${token}/email/${r.id}/view`;
       // Each item carries the full HTML in content:encoded.
       return `    <item>
       <title>${escapeXml(r.subject)}</title>
@@ -574,10 +579,39 @@ async function renderEmailView(env: Env, base: string, id: number): Promise<Resp
   <div class="meta">
     <div><span class="k">From</span> ${escapeXml(from)}</div>
     <div><span class="k">Received</span> ${fmtDate(r.received_at)}</div>
+    <div><a href="${base}/email/${id}/view" target="_blank">Open clean view ↗</a></div>
   </div>
   <iframe class="render" sandbox="allow-popups allow-popups-to-escape-sandbox"
           srcdoc="${escapeAttr(r.html)}"></iframe>`;
   return html(layout(base, r.subject || "Email", inner));
+}
+
+// Bare, chrome-free rendering of one email: a full-bleed sandboxed iframe and
+// nothing else (no nav/header). This is the URL used in the RSS item <link>,
+// so "open in browser" shows the message rendered faithfully. Same sandbox as
+// the admin view — the stored HTML is untrusted third-party content, so no
+// scripts and no same-origin. srcdoc parses fragments (e.g. unwrapped forwards)
+// as a full document, so no <html>/<body> wrapping is needed.
+async function renderEmailRaw(env: Env, id: number): Promise<Response> {
+  const r = await env.DB.prepare(`SELECT subject, html FROM emails WHERE id = ?`)
+    .bind(id)
+    .first<Pick<EmailRow, "subject" | "html">>();
+  if (!r) return html("<h1>Email not found</h1>", 404);
+
+  const doc = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeXml(r.subject || "Email")}</title>
+<style>html,body{margin:0;height:100%}iframe{border:0;width:100%;height:100%;display:block}</style>
+</head><body>
+<iframe sandbox="allow-popups allow-popups-to-escape-sandbox" srcdoc="${escapeAttr(r.html)}"></iframe>
+</body></html>`;
+  return new Response(doc, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      // Don't leak the token-bearing URL to the newsletter's remote assets.
+      "Referrer-Policy": "no-referrer",
+    },
+  });
 }
 
 async function renderErrorList(env: Env, base: string): Promise<string> {

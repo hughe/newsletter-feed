@@ -19,7 +19,7 @@ test("each item gets an open-in-browser <link> to the Worker's email view", () =
   const xml = buildRss([row], url, "Forwarded Newsletters", "TOKEN");
   assert.match(
     xml,
-    /<link>https:\/\/newsletter-rss\.example\.workers\.dev\/feed\/TOKEN\/email\/42<\/link>/
+    /<link>https:\/\/newsletter-rss\.example\.workers\.dev\/feed\/TOKEN\/email\/42\/view<\/link>/
   );
   // The stable guid stays the message-id, not the link.
   assert.match(xml, /<guid isPermaLink="false">&lt;abc@example\.com&gt;<\/guid>/);
