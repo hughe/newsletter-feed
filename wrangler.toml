@@ -9,13 +9,12 @@ compatibility_date = "2025-01-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "newsletters"
-database_id = "REPLACE_WITH_DATABASE_ID"
+database_id = "99e5d04c-4202-4607-abc2-a9837acee9e3"
 
 [vars]
 # RSS channel title.
 FEED_TITLE = "Forwarded Newsletters"
-# FEED_TOKEN gates ALL URLs (feed + admin). Generate with:
-#   openssl rand -hex 24
-# For better secrecy, drop it here and instead run:
+# FEED_TOKEN gates ALL URLs (feed + admin). NOT stored here (this file is in
+# git). It is set as an encrypted secret instead:
 #   npx wrangler secret put FEED_TOKEN
-FEED_TOKEN = "REPLACE_WITH_TOKEN"
+# Generate a value with: openssl rand -hex 24
