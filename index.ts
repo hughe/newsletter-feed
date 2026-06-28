@@ -96,12 +96,12 @@ export default {
     // RSS feed keeps its original URL so existing subscriptions don't break.
     if (path === `/feed/${token}.xml`) {
       const { results } = await env.DB.prepare(
-        `SELECT message_id, from_addr, from_name, subject, html, received_at
+        `SELECT id, message_id, from_addr, from_name, subject, html, received_at
            FROM emails
           ORDER BY received_at DESC
           LIMIT 100`
       ).all<EmailRow>();
-      return new Response(buildRss(results || [], url, env.FEED_TITLE), {
+      return new Response(buildRss(results || [], url, env.FEED_TITLE, token), {
         headers: {
           "Content-Type": "application/rss+xml; charset=utf-8",
           "Cache-Control": "max-age=60",
@@ -394,7 +394,7 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function buildRss(rows: EmailRow[], url: URL, title: string): string {
+export function buildRss(rows: EmailRow[], url: URL, title: string, token: string): string {
   const feedTitle = title || "Forwarded Newsletters";
   const self = url.href;
   const home = `${url.protocol}//${url.host}`;
@@ -405,9 +405,14 @@ function buildRss(rows: EmailRow[], url: URL, title: string): string {
       const author = r.from_name
         ? `${r.from_name} <${r.from_addr}>`
         : r.from_addr;
+      // <link> points at the Worker's own single-email view, which renders the
+      // stored HTML faithfully in a browser — useful when an RSS reader mangles
+      // the newsletter's CSS. (The token is already in the feed URL itself.)
+      const link = `${home}/feed/${token}/email/${r.id}`;
       // Each item carries the full HTML in content:encoded.
       return `    <item>
       <title>${escapeXml(r.subject)}</title>
+      <link>${escapeXml(link)}</link>
       <guid isPermaLink="false">${escapeXml(r.message_id)}</guid>
       <pubDate>${date}</pubDate>
       <dc:creator>${escapeXml(author)}</dc:creator>
