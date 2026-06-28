@@ -61,6 +61,7 @@ The Worker reads three things from `env`, configured in `wrangler.toml`:
 
 ## Notes for working here
 
+- **Never wipe or reset the production D1 database (`newsletters`) when deploying.** It holds the user's real stored newsletters. `make deploy` / `wrangler deploy` is code-only and never touches D1 — that's safe. Don't run destructive D1 commands as part of a deploy (`DELETE`/`DROP`), and don't re-run `make schema-remote` on code-only changes (it's harmless `CREATE TABLE IF NOT EXISTS`, just unnecessary). The deploy gate `make test` runs only against local fixtures in `test/`, never the remote DB.
 - `README.md` and `PLAN.md` refer to the Worker as `src/index.js`, but the file is actually `index.ts` at the repo root. Those docs predate both the TypeScript conversion and the creation of `wrangler.toml`/`package.json`/`tsconfig.json` — the config files now exist, but `wrangler.toml` ships with placeholder `database_id` and `FEED_TOKEN` values that must be filled in before a real deploy (see `PLAN.md` "Build & deploy").
 - **TypeScript types live in `index.ts` itself.** `Env` (the bindings) plus `EmailRow`/`ErrorRow` row shapes are declared at the top; D1 reads are typed via `.all<T>()`/`.first<T>()`, and the escaping helpers take `unknown`. There's no separate `.d.ts`. Worker globals (`D1Database`, `ExportedHandler`, etc.) come from `@cloudflare/workers-types` via `tsconfig.json`'s `types` array.
 - The feed returns the 100 most recent emails (`LIMIT 100` in the feed query); admin lists show 200. Both are hardcoded.
