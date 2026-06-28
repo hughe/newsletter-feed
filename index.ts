@@ -586,30 +586,65 @@ async function renderEmailView(env: Env, base: string, id: number): Promise<Resp
   return html(layout(base, r.subject || "Email", inner));
 }
 
-// Bare, chrome-free rendering of one email: a full-bleed sandboxed iframe and
-// nothing else (no nav/header). This is the URL used in the RSS item <link>,
-// so "open in browser" shows the message rendered faithfully. Same sandbox as
-// the admin view — the stored HTML is untrusted third-party content, so no
-// scripts and no same-origin. srcdoc parses fragments (e.g. unwrapped forwards)
-// as a full document, so no <html>/<body> wrapping is needed.
+// Bare, chrome-free rendering of one email: the stored HTML served directly as
+// the page (no nav/header, no iframe — iframes with srcdoc render poorly in
+// mobile Safari). This is the URL used in the RSS item <link>, so "open in
+// browser" shows the message rendered faithfully.
+//
+// The HTML is untrusted third-party content, so instead of an <iframe sandbox>
+// we apply the same protection at the document level with a `Content-Security-
+// Policy: sandbox` header: no scripts run and the page gets a unique opaque
+// origin — important because the URL carries the secret token. allow-popups /
+// top-navigation keep the newsletter's links clickable.
+// "Fit to screen" CSS for the chrome-free /view. Many newsletters are not
+// responsive (fixed-width tables wider than a phone). Capping every element at
+// its container width (which bottoms out at the viewport) forces the whole tree
+// to fit; height:auto keeps image aspect ratios once their width is clamped.
+const FIT_CSS =
+  `<style>*{max-width:100%!important}img{height:auto!important}</style>`;
+
+// Inject FIT_CSS (and a viewport meta if the document lacks one) into a full
+// HTML document's <head>, falling back to wrapping a <head> around the content.
+export function injectMobileFit(htmlDoc: string): string {
+  const needViewport = !/<meta[^>]+name=["']?viewport/i.test(htmlDoc);
+  const inject =
+    (needViewport
+      ? `<meta name="viewport" content="width=device-width, initial-scale=1">`
+      : "") + FIT_CSS;
+  if (/<head[^>]*>/i.test(htmlDoc)) {
+    return htmlDoc.replace(/<head[^>]*>/i, (m) => m + inject);
+  }
+  if (/<html[^>]*>/i.test(htmlDoc)) {
+    return htmlDoc.replace(/<html[^>]*>/i, (m) => `${m}<head>${inject}</head>`);
+  }
+  return `${inject}${htmlDoc}`;
+}
+
 async function renderEmailRaw(env: Env, id: number): Promise<Response> {
   const r = await env.DB.prepare(`SELECT subject, html FROM emails WHERE id = ?`)
     .bind(id)
     .first<Pick<EmailRow, "subject" | "html">>();
   if (!r) return html("<h1>Email not found</h1>", 404);
 
-  const doc = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeXml(r.subject || "Email")}</title>
-<style>html,body{margin:0;height:100%}iframe{border:0;width:100%;height:100%;display:block}</style>
-</head><body>
-<iframe sandbox="allow-popups allow-popups-to-escape-sandbox" srcdoc="${escapeAttr(r.html)}"></iframe>
-</body></html>`;
-  return new Response(doc, {
+  // Full newsletters ship a complete <html> document; unwrapped forwards are a
+  // fragment — wrap those so they get a charset and a mobile viewport. Either
+  // way, inject FIT_CSS so non-responsive emails (fixed-width tables wider than
+  // the screen) shrink to fit mobile Safari instead of overflowing.
+  const isFullDoc = /<html[\s>]/i.test(r.html);
+  const body = isFullDoc
+    ? injectMobileFit(r.html)
+    : `<!doctype html><html><head><meta charset="utf-8">` +
+      `<meta name="viewport" content="width=device-width, initial-scale=1">` +
+      `<title>${escapeXml(r.subject || "Email")}</title>${FIT_CSS}</head><body>${r.html}</body></html>`;
+
+  return new Response(body, {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
+      "Content-Security-Policy":
+        "sandbox allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation",
       // Don't leak the token-bearing URL to the newsletter's remote assets.
       "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }
