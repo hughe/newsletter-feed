@@ -8,13 +8,14 @@ A single Cloudflare Worker that turns forwarded email newsletters into a private
 
 ## Commands
 
-A `Makefile` wraps the common tasks (`make install`, `make dev`, `make typecheck`, `make deploy`, `make schema-local`, `make schema-remote`, `make errors`). `make deploy` runs `typecheck` first, so a type error aborts the deploy.
+A `Makefile` wraps the common tasks (`make install`, `make dev`, `make typecheck`, `make test`, `make deploy`, `make schema-local`, `make schema-remote`, `make errors`). `make deploy` runs `typecheck` and `test` first, so a type error or test failure aborts the deploy.
 
 ```
 make install        # npm install — deps: postal-mime; dev deps: typescript, @cloudflare/workers-types, wrangler
 make dev            # local dev server on :8787 (npx wrangler dev)
 make typecheck      # npx tsc --noEmit (wrangler does NOT type-check at deploy; this is the only gate)
-make deploy         # typecheck, then npx wrangler deploy
+make test           # node --test over test/*.ts (Node strips types natively; no deps/build)
+make deploy         # typecheck + test, then npx wrangler deploy
 
 npx wrangler d1 create newsletters                                # one-time; copy database_id into wrangler.toml
 make schema-local                                                 # apply schema locally
@@ -30,13 +31,13 @@ curl -X POST 'http://localhost:8787/cdn-cgi/handler/email' \
   --header 'Content-Type: application/json' --data-binary @sample-email.eml
 ```
 
-There is no test suite or lint step. `wrangler` bundles `index.ts` directly via esbuild, which **strips types without checking them** — so `tsc --noEmit` (run by `make typecheck`, and as the first step of `make deploy`) is the only thing that enforces type safety.
+There is no lint step. Tests live in `test/*.test.ts` and run on Node's built-in runner (`make test`) — Node 22 strips the TypeScript types natively, so there's no build step and no test dependency; the test files import `ingest`/`unwrapForwardedHtml` straight from `index.ts`. `wrangler` bundles `index.ts` directly via esbuild, which **strips types without checking them** — so `tsc --noEmit` (run by `make typecheck`) is the only thing that enforces type safety. Both `typecheck` and `test` run as the first steps of `make deploy`.
 
 ## Architecture
 
 All code is in **`index.ts`** — one Worker default export, typed with `satisfies ExportedHandler<Env>`, with two handlers:
 
-- **`email(message, env, ctx)`** — ingest. Buffers the raw stream up front (a `ReadableStream` can only be read once, and the raw bytes are needed for the errors table if parsing throws). Parses with `postal-mime`. Forwarded newsletters sometimes nest the original as a `message/rfc822` attachment — when present, the nested original's html/text/subject/from take precedence over the outer (forwarding) wrapper. Plaintext-only mail is wrapped in `<pre>` so the feed still renders.
+- **`email(message, env, ctx)`** — ingest. Buffers the raw stream up front (a `ReadableStream` can only be read once, and the raw bytes are needed for the errors table if parsing throws). Parses with `postal-mime`. Forwarded newsletters sometimes nest the original as a `message/rfc822` attachment — when present, the nested original's html/text/subject/from take precedence over the outer (forwarding) wrapper. Apple Mail and Gmail instead *inline*-forward (the original is pasted into the body behind a header preamble, not nested); `unwrapForwardedHtml` detects those two clients' wrappers (`<blockquote type="cite">` / `<div class="gmail_quote">`), recovers the original subject/sender, and strips the preamble. It returns `null` when no wrapper is recognised, so non-forwards pass through untouched (covered by `test/forward.test.ts`). Plaintext-only mail is wrapped in `<pre>` so the feed still renders.
 - **`fetch(request, env, ctx)`** — a hand-rolled path router (no framework). The RSS feed lives at `/feed/<token>.xml`; admin pages live under `/feed/<token>/...`. HTML pages are built by string-templating functions (`layout`, `renderDashboard`, `renderEmailList`, `renderEmailView`, etc.) sharing the `STYLE` constant. `POST /feed/<token>/error/<id>/replay` (and a button on the error view) re-runs a stored failure through the parser — see replay below.
 
 The parse-and-extract logic lives in a shared **`ingest(rawBytes, fallbackFrom)`** that returns a discriminated `IngestResult` (`{ok:true,...}` | `{ok:false, reason, ...}`) instead of touching the DB. Both `email()` (live mail) and `replayError()` (reprocessing) call it, so a parser fix applies identically to both. `email()` writes the result to `emails`/`errors`; `replayError()` reads `errors.raw`, re-ingests, and on success stores the email and **deletes** the error row (on failure the row is kept). Note `errors.raw` is the UTF-8-decoded source, so replay re-encodes it with `TextEncoder` — lossless for typical newsletters, but raw 8-bit/binary MIME could differ slightly from the bytes Cloudflare originally delivered.

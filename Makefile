@@ -1,4 +1,4 @@
-.PHONY: install dev typecheck deploy schema-local schema-remote errors
+.PHONY: install dev typecheck test deploy schema-local schema-remote errors
 
 # Install dependencies.
 install:
@@ -12,8 +12,12 @@ dev:
 typecheck:
 	npx tsc --noEmit
 
-# Deploy to Cloudflare. Type-checks first; a type error aborts the deploy.
-deploy: typecheck
+# Run the test suite. Node strips the TypeScript types natively (no build step).
+test:
+	node --disable-warning=ExperimentalWarning --test test/*.test.ts
+
+# Deploy to Cloudflare. Type-checks and tests first; either failing aborts it.
+deploy: typecheck test
 	npx wrangler deploy
 
 # Apply the D1 schema locally.

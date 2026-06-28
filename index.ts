@@ -146,7 +146,7 @@ export default {
 // Parse a raw RFC822 message and extract the fields we store. Pure: no DB
 // access, and it never throws for an expected failure — parse errors and
 // missing bodies come back as an IngestFailure so callers decide what to do.
-async function ingest(
+export async function ingest(
   rawBytes: Uint8Array,
   fallbackFrom: string | null
 ): Promise<IngestResult> {
@@ -190,6 +190,21 @@ async function ingest(
     }
   }
 
+  // Apple Mail and Gmail don't nest the original — they inline-forward it into
+  // the body behind a header preamble ("Begin forwarded message:" / "Forwarded
+  // message"). If the body still looks like one of those wrappers, recover the
+  // original subject/sender and strip the preamble so the feed shows the
+  // newsletter, not the forward. No-op (returns null) when no wrapper is found.
+  const fwd = unwrapForwardedHtml(html);
+  if (fwd) {
+    if (fwd.html) html = fwd.html;
+    if (fwd.subject) subject = fwd.subject;
+    if (fwd.fromAddr) {
+      fromAddr = fwd.fromAddr;
+      fromName = fwd.fromName || fromName;
+    }
+  }
+
   // If there's truly no HTML, wrap the plaintext so the feed still renders.
   if (!html && text) {
     html = `<pre style="white-space:pre-wrap">${escapeHtml(text)}</pre>`;
@@ -210,6 +225,151 @@ async function ingest(
     html,
     text,
   };
+}
+
+// ---- Inline-forward unwrapping --------------------------------------------
+// Apple Mail and Gmail "forward" a newsletter by pasting the original into the
+// body behind a header preamble (From/Subject/Date/...), rather than nesting it
+// as a message/rfc822 part. These helpers detect that wrapper, recover the
+// original sender/subject, and return the newsletter HTML with the preamble
+// stripped. They return null when no wrapper is recognised, so the caller keeps
+// the body unchanged — we never emit an empty body.
+
+interface Forwarded {
+  html: string;
+  subject?: string;
+  fromAddr?: string;
+  fromName?: string;
+}
+
+export function unwrapForwardedHtml(html: string): Forwarded | null {
+  return unwrapAppleForward(html) ?? unwrapGmailForward(html);
+}
+
+// Build a Forwarded from the newsletter body plus parsed preamble headers.
+function forwardedFromHeaders(
+  body: string,
+  headers: Record<string, string>
+): Forwarded {
+  const out: Forwarded = { html: body };
+  if (headers.subject) {
+    out.subject = headers.subject.replace(/^(re|fwd|fw)\s*:\s*/i, "").trim();
+  }
+  if (headers.from) {
+    const { name, addr } = parseAddress(headers.from);
+    if (addr) out.fromAddr = addr;
+    if (name) out.fromName = name;
+  }
+  return out;
+}
+
+// Strip tags and decode the handful of entities these clients emit, yielding
+// the plain text of a header value.
+function htmlToText(s: string): string {
+  return decodeEntities(s.replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
+}
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&");
+}
+
+// Split a "Name <addr@host>" (or bare address) header value into parts.
+function parseAddress(raw: string): { name: string; addr: string } {
+  const m = raw.match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
+  if (m) return { name: m[1].replace(/^"|"$/g, "").trim(), addr: m[2].trim() };
+  if (raw.includes("@")) return { name: "", addr: raw.trim() };
+  return { name: raw.trim(), addr: "" };
+}
+
+// Index just past the close tag that balances the opening <tag ...> at `start`
+// (which must index its '<'). Handles nested same-name tags. -1 if unbalanced.
+function elementEnd(s: string, tag: string, start: number): number {
+  const re = new RegExp(`<${tag}\\b[^>]*>|</${tag}\\s*>`, "gi");
+  re.lastIndex = start;
+  let depth = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s))) {
+    if (m[0][1] === "/") {
+      depth--;
+      if (depth === 0) return re.lastIndex;
+    } else {
+      depth++;
+    }
+  }
+  return -1;
+}
+
+// Apple Mail: <blockquote type="cite"> opening with "Begin forwarded message:"
+// then a run of header <div>s, then the original content — all in the quote.
+function unwrapAppleForward(html: string): Forwarded | null {
+  const bqStart = html.search(/<blockquote[^>]*type="cite"[^>]*>/i);
+  if (bqStart < 0) return null;
+  const openEnd = html.indexOf(">", bqStart) + 1;
+  const bqEnd = elementEnd(html, "blockquote", bqStart);
+  const inner =
+    bqEnd < 0
+      ? html.slice(openEnd)
+      : html.slice(openEnd, bqEnd - "</blockquote>".length);
+  if (!/Begin forwarded message/i.test(inner)) return null;
+
+  let body = inner;
+  body = body.replace(/^\s*<div>\s*Begin forwarded message:\s*<\/div>/i, "");
+  body = body.replace(/^\s*<br[^>]*Apple-interchange-newline[^>]*>/i, "");
+
+  const headers: Record<string, string> = {};
+  // Consume the leading header <div>s (each holds "<b>Label: </b> value").
+  for (;;) {
+    body = body.replace(/^\s*(?:<br[^>]*>\s*)*/i, "");
+    if (!/^<div\b/i.test(body)) break;
+    const end = elementEnd(body, "div", 0);
+    if (end < 0) break;
+    const divHtml = body.slice(0, end);
+    const label = divHtml.match(
+      /<b>\s*(From|Subject|Date|To|Cc|Bcc|Reply-To|Sender)\s*:\s*<\/b>/i
+    );
+    if (!label) break; // first non-header div = start of the newsletter
+    const value = htmlToText(divHtml.replace(/<b>\s*[^<]*:\s*<\/b>/i, ""));
+    headers[label[1].toLowerCase()] = value;
+    body = body.slice(end);
+  }
+
+  body = body.trim();
+  if (!body) return null;
+  return forwardedFromHeaders(body, headers);
+}
+
+// Gmail: <div class="gmail_attr"> holds "Forwarded message" + <br>-separated
+// headers; the original content follows it inside <div class="gmail_quote">.
+function unwrapGmailForward(html: string): Forwarded | null {
+  const attr = html.match(/<div[^>]*class="[^"]*gmail_attr[^"]*"[^>]*>/i);
+  if (!attr || attr.index === undefined) return null;
+  const attrStart = attr.index;
+  const attrOpenEnd = attrStart + attr[0].length;
+  const attrEnd = elementEnd(html, "div", attrStart);
+  if (attrEnd < 0) return null;
+  const attrInner = html.slice(attrOpenEnd, attrEnd - "</div>".length);
+  if (!/Forwarded message/i.test(attrInner)) return null;
+
+  const headers: Record<string, string> = {};
+  for (const line of attrInner.split(/<br\s*\/?>/i)) {
+    const text = htmlToText(line);
+    const m = text.match(
+      /^(From|Subject|Date|To|Cc|Bcc|Reply-To|Sender)\s*:\s*(.*)$/i
+    );
+    if (m) headers[m[1].toLowerCase()] = m[2].trim();
+  }
+
+  // The newsletter content follows the attr div. A fragment (with the trailing
+  // gmail_quote/wrapper </div>s) is fine for RSS CDATA and the sandboxed iframe.
+  const body = html.slice(attrEnd).replace(/^\s*(?:<br\s*\/?>\s*)*/i, "").trim();
+  if (!body) return null;
+  return forwardedFromHeaders(body, headers);
 }
 
 // Persist a successfully-ingested message. Deduped by message_id.
