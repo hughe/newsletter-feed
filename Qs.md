@@ -3,10 +3,6 @@
 Working notes on testing, configuring, deploying, and the Cloudflare/DNS
 decision for this project. Not part of the deployed Worker.
 
-> **Blocker:** the project can't be tested or deployed until `package.json`
-> and `wrangler.toml` exist — they're referenced in the docs but not yet in
-> the repo.
-
 ---
 
 ## Testing, prefix, Cloudflare setup, and the CLI
@@ -42,7 +38,7 @@ npx wrangler deploy
 3. Email Workers -> bind an address (e.g. `news@yourdomain.com`, or a
    catch-all) to the `newsletter-rss` Worker.
 
-Then forward a newsletter to that address; it flows into `index.js`'s
+Then forward a newsletter to that address; it flows into `index.ts`'s
 `email()` handler.
 
 ### Setting the prefix
@@ -54,8 +50,8 @@ Three different "prefixes" — keep them separate:
   securely as `npx wrangler secret put FEED_TOKEN`. Generate with
   `openssl rand -hex 24`. Feed URL becomes
   `https://newsletter-rss.<subdomain>.workers.dev/feed/<TOKEN>.xml`.
-- **Literal `/feed/` segment** — hardcoded in `index.js` (`/feed/${token}.xml`
-  at line 94 and ``const base = `/feed/${token}` `` at line 110). Only edit
+- **Literal `/feed/` segment** — hardcoded in `index.ts` (`/feed/${token}.xml`
+  at line 97 and ``const base = `/feed/${token}` `` at line 113). Only edit
   those to change the word in the path.
 - **Email address prefix** (the `news@` part) — not in code; whatever address
   you bind in Cloudflare Email Routing.
